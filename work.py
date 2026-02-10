@@ -148,6 +148,7 @@ class DecensorMaskManager:
             output_np = l_enhanced
 
         return Image.fromarray(output_np)
+    
     def load_sam2(self):
         if self.sam_model is None:
             print(f"正在从本地路径加载 SAM2.1 模型: {SAM2_MODEL_PATH}")
