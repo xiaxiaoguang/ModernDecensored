@@ -9,7 +9,7 @@ from scipy.ndimage import label, binary_dilation
 import gc
 from utils.tools import smart_resize
 # ================= CONFIGURATION =================
-INPUT_DIR = "G://manga/K2"
+INPUT_DIR = "G://manga/K1"
 OUTPUT_ROOT = "dataset_refined"
 
 # Processing Settings
