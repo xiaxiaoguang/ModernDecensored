@@ -18,10 +18,7 @@ from diffusers import DPMSolverMultistepScheduler, DiffusionPipeline, AutoPipeli
 from transformers import Sam2Processor, Sam2Model
 import cv2
 # Placeholder for local tools if they exist, otherwise ignore
-try:
-    from .tools import *
-except ImportError:
-    pass
+from .tools import *
 
 # Define your LoRA path (update this to your output folder)
 LORA_PATH = "./output_lora/final_lora_waifu_inpaint"

@@ -2,7 +2,7 @@ import time
 import torch
 import cv2
 import numpy as np
-from ultralytics import YOLO
+# from ultralytics import YOLO
 
 # ================= CONFIGURATION =================
 # Training Settings (For your 4x 3090 Server)
