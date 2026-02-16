@@ -9,9 +9,9 @@ import argparse
 import re
 import random
 from PIL import Image, ImageFilter, ImageChops, ImageOps, ImageEnhance, ImageDraw
-# from pywinauto import Application, Desktop
-from scipy.ndimage import label, binary_dilation, center_of_mass 
+from pywinauto import Application, Desktop
 
+from scipy.ndimage import label, binary_dilation, center_of_mass 
 from diffusers import DiffusionPipeline
 from transformers import Sam2Processor, Sam2Model
 from utils.inpainter import DecensorInpainter,DecensorInpainter2
@@ -170,21 +170,49 @@ class DecensorMaskManager:
             if 'Paths' not in config: config['Paths'] = {}
             config['Paths']['input'] = input_dir
             with open(config_path, 'w') as f: config.write(f)
-
+            
     def segment_images_to_temp(self):
         print(f"模式: Segmentation - 正在准备带固定偏置缓冲的 HAI 检测块 (Tile Size: {LOGICAL_TILE_W}x{LOGICAL_TILE_H})...")
         if os.path.exists(self.args.temp_tiles): shutil.rmtree(self.args.temp_tiles)
         os.makedirs(self.args.temp_tiles)
         
+        # Setup a debug folder to output the masks and distance heatmaps
+        debug_dir = os.path.join(self.args.input, "debug_black_distances")
+        os.makedirs(debug_dir, exist_ok=True)
+        
         files = [f for f in os.listdir(self.args.input) if f.lower().endswith(('.png', '.jpg', '.jpeg', '.webp', '.bmp'))]
         files.sort(key=lambda f: [int(c) if c.isdigit() else c.lower() for c in re.split(r'(\d+)', f)])
         
-        for i,f in enumerate(files):
-            img = smart_resize(Image.open(os.path.join(self.args.input, f)).convert("RGB"))
-            
-            # Apply darkening preprocessing here
-            # if self.args.black_level > 0:
+        for i, f in enumerate(files):
+            orig_path = os.path.join(self.args.input, f)
+            img = smart_resize(Image.open(orig_path).convert("RGB"))
             img = self.preprocess_smart_detection(img)
+            img_np = np.array(img)
+            
+            # 1. Create a binary mask of pure black pixels ([0, 0, 0])
+            is_black = np.all(img_np == [0, 0, 0], axis=-1)
+            black_mask = np.uint8(is_black) * 255
+            
+            # Save the raw black pixel mask
+            cv2.imwrite(os.path.join(debug_dir, f"{i}_black_mask.png"), black_mask)
+            
+            # 2. Distance Transform
+            # cv2.distanceTransform calculates the distance to the nearest ZERO pixel.
+            # We invert the mask so black pixels = 0, and everything else = 255.
+            inverted_mask = cv2.bitwise_not(black_mask)
+            
+            # Calculate L2 (Euclidean) distance
+            dist_transform = cv2.distanceTransform(inverted_mask, cv2.DIST_L2, 5)
+            
+            # Normalize the distance map to 0-255 for visualization
+            dist_visual = cv2.normalize(dist_transform, None, 0, 255, cv2.NORM_MINMAX)
+            dist_visual = np.uint8(dist_visual)
+            
+            # Apply a JET colormap (Red = far from black, Blue = close to black/is black)
+            heatmap = cv2.applyColorMap(dist_visual, cv2.COLORMAP_JET)
+            cv2.imwrite(os.path.join(debug_dir, f"{i}_distance_heatmap.png"), heatmap)
+            # ---------------------------------------------------------
+
             w, h = img.size
             tile_configs = get_tiles_with_padding((w, h))
             for config in tile_configs:
@@ -351,7 +379,7 @@ class DecensorMaskManager:
             merged_tile.save(save_path)
             print(f"  [{orig_file}] 合并完成 -> {save_path}")
 
-    def refine_masks_with_sam2_points(self, image_1024, initial_mask_1024):
+    def refine_masks_with_sam2_points(self, image_1024, initial_mask_1024, limit=25):
         """
         Refines mask using SAM 2. 
         Args:
@@ -359,54 +387,41 @@ class DecensorMaskManager:
             initial_mask_1024: A 1024x1024 PIL Image (L mode) containing the rough mask to refine.
         """
         mask_data = np.array(initial_mask_1024)
-        
-        # 1. Label connected components
+        refined_full_mask_acc = np.copy(mask_data)
+        dark_limit = self.args.black_level
+        # breakpoint()
+        # --- PHASE 1: PREPARE PROMPTS FROM INITIAL MASK ---
+        # We process input blocks to determine WHERE to click.
         labeled_array, num_features = label(mask_data > 128)
         if num_features == 0: 
             return initial_mask_1024
-
-        # 2. Analyze Component Sizes to Filter Scatter
-        component_props = [] # List of (label_id, area)
+        # Sort input components by size just to process main parts first
+        input_components = []
         for i in range(1, num_features + 1):
             area = np.sum(labeled_array == i)
-            component_props.append((i, area))
-        
-        # Sort by area (Largest to Smallest)
-        component_props.sort(key=lambda x: x[1], reverse=True)
-
-        # 3. Apply "Sudden Decrease" Logic
-        # We keep the top blocks. If the next block is significantly smaller 
-        # than the previous one (the "cliff"), we stop.
-        valid_labels = []
-        if len(component_props) > 0:
-            valid_labels.append(component_props[0][0]) # Always keep the biggest one
-            for i in range(1, len(component_props)):
-                current_area = component_props[i][1]
-                prev_area = component_props[i-1][1]
-                # THRESHOLD: If current is less than 15% of previous, treat as scatter/noise
-                if current_area < (prev_area * 0.15): 
-                    # print(f"   [Filter] Drop detected at index {i}: {current_area} vs {prev_area}. Stopping.")
-                    break
-                valid_labels.append(component_props[i][0])
-
-        # Initialize accumulator for the result
-        refined_full_mask_acc = np.zeros_like(mask_data)
-
-        # 4. Process only VALID components
-        for i, label_id in enumerate(valid_labels):
-            # Get coords for this island
-            coords = np.argwhere(labeled_array == label_id)
+            # Filter extremely small noise in input to avoid bad prompts
+            if area > 10: 
+                input_components.append((i, area))
+        input_components.sort(key=lambda x: x[1], reverse=True)
+        # Loop through input blobs to generate prompts
+        for i, (label_id, area) in enumerate(input_components):
             
             # --- GENERATE POINT PROMPT (Centroid) ---
-            # No Bounding Box as requested.
-            median_idx = len(coords) // 2
-            center_y, center_x = coords[median_idx] # Guaranteed interior point
-            
-            # Prepare inputs for SAM
-            # Note: SAM expects [x, y] format for points
+            coords = np.argwhere(labeled_array == label_id)
+            median_idx = random.randint(0, len(coords)-1)
+            center_y, center_x = coords[median_idx] # Prepare inputs for SAM
+            img_gray = np.array(image_1024.convert("L"))
+            current_try = 0
+            while (img_gray[center_y,center_x]) > dark_limit and current_try < 50:
+                median_idx =  random.randint(0, len(coords)-1)
+                center_y, center_x = coords[median_idx] # Prepare inputs for SAM
+                current_try += 1
+            if current_try == 50 :
+                continue
+            # breakpoint()
             input_point = [[int(center_x), int(center_y)]]
             input_label = [1] # 1 = Foreground
-
+        
             inputs = self.sam_processor(
                 images=image_1024, 
                 input_points=[[input_point]], 
@@ -417,122 +432,124 @@ class DecensorMaskManager:
             with torch.no_grad():
                 outputs = self.sam_model(**inputs, multimask_output=False)
             
-            # Post-process (scale back to 1024x1024)
-            masks = self.sam_processor.post_process_masks(
-                outputs.pred_masks.cpu(), 
-                inputs["original_sizes"], 
-            )[0]
-            
-            # Extract the single best mask (since multimask_output=False)
-            # Sigmoid > 0.0 is standard for binary classification in SAM2
-            pred_mask = (masks[0] > 0.0).numpy().squeeze() 
-            
-            island_refined = (pred_mask).astype(np.uint8) * 255
-            
-            # Union (Merge) logic
+            pred_prob = torch.sigmoid(outputs.pred_masks).cpu().numpy().squeeze()
+            pred_mask = (pred_prob > 0.5).astype(np.uint8) * 255
+            pred_img = Image.fromarray(pred_mask).resize(image_1024.size, Image.NEAREST)
+
+            pred_labeled, pred_num_features = label(pred_img)
+            if pred_num_features == 0: continue
+            sam_islands = []
+            for j in range(1, pred_num_features + 1):
+                island_area = np.sum(pred_labeled == j)
+                sam_islands.append((j, island_area))
+            # Sort SAM islands by size (Largest to Smallest)
+            sam_islands.sort(key=lambda x: x[1], reverse=True)
+            clean_island_mask = np.zeros_like(pred_img)
+            if len(sam_islands) > 0:
+                top_label, top_area = sam_islands[0]
+                clean_island_mask[pred_labeled == top_label] = 1
+                for j in range(1, len(sam_islands)):
+                    curr_label, curr_area = sam_islands[j]
+                    # mask_bool = ((curr_area) > 0)
+                    masked_pixels = img_gray[pred_labeled == curr_label]
+                    mean_val = np.mean(masked_pixels)
+                    std_val = np.std(masked_pixels)
+                    # print(mean_val,std_val)
+                    # breakpoint()
+                    if self.args.mosaic_color == 0: # BLACK
+                        if not(mean_val < dark_limit and std_val < 15): continue
+                    elif self.args.mosaic_color == 1: # WHITE
+                        NotImplementedError
+                    if curr_area < 8:
+                        break
+                    clean_island_mask[pred_labeled == curr_label] = 1
+                    
+            # if self.args.mosaic == 2: # Solid Bar
+            clean_island_mask &= (img_gray < dark_limit)
+            # Convert to uint8 for accumulation
+            island_refined = (clean_island_mask > 0).astype(np.uint8) * 255
+            # Merge into final result
             refined_full_mask_acc = np.maximum(refined_full_mask_acc, island_refined)
         
-        return Image.fromarray(refined_full_mask_acc)
-
+                
+        # filt the mask again, remove the connection blocks that are too small (<5 pixels), the logics are same as above one 
+        final_labeled, final_num_features = label(refined_full_mask_acc > 128)
+        if final_num_features > 0:
+            final_clean_mask = np.zeros_like(refined_full_mask_acc)
+            for k in range(1, final_num_features + 1):
+                block_area = np.sum(final_labeled == k)
+                if block_area >= limit:  # Keep blocks 5 pixels or larger
+                    final_clean_mask[final_labeled == k] = 255
+            refined_full_mask_acc = final_clean_mask
+        refined_full_mask_acc = Image.fromarray(refined_full_mask_acc)
+        
+        return refined_full_mask_acc
+    
     def mask_refinement_process(self):
-        self.load_sam2()
-        if not os.path.exists(self.hai_mask_folder): return
-        
-        input_files = [f for f in os.listdir(self.args.input) if f.lower().endswith(('.png', '.jpg', '.jpeg'))]
-        # Sort naturally to keep order
-        input_files.sort(key=lambda f: [int(c) if c.isdigit() else c.lower() for c in re.split(r'(\d+)', f)])
-        
-        for idx, orig_file in enumerate(input_files):
-            orig_path = os.path.join(self.args.input, orig_file)
-            original_img = smart_resize(Image.open(orig_path).convert("RGB"))
-            original_img = self.preprocess_smart_detection(original_img)
+            self.load_sam2()
+            if not os.path.exists(self.hai_mask_folder): return
             
-            # Find all mask tiles associated with this image ID
-            tile_files = [f for f in os.listdir(self.hai_mask_folder) if f.startswith(f"{idx}_T_") and f.endswith(".png")]
+            input_files = [f for f in os.listdir(self.args.input) if f.lower().endswith(('.png', '.jpg', '.jpeg', '.webp', '.bmp'))]
+            input_files.sort(key=lambda f: [int(c) if c.isdigit() else c.lower() for c in re.split(r'(\d+)', f)])
             
-            if not tile_files: continue
-            
-            print(f"[*] Refining {orig_file}: Processing {len(tile_files)} tiles with 1024px Context...")
-            
-            for m_file in tile_files:
-                # 1. Parse Coordinates from Filename
-                px1, py1, px2, py2 = 0, 0, 0, 0
-                is_merged_file = "merged" in m_file
+            for idx, orig_file in enumerate(input_files):
+                orig_path = os.path.join(self.args.input, orig_file)
+                original_img = smart_resize(Image.open(orig_path).convert("RGB"))
+                
+                # if self.args.black_level > 0:
+                original_img = self.preprocess_smart_detection(original_img)
+                
+                # CHANGE 1: Removed 'and "merged" not in f' to allow merged files
+                tile_files = [f for f in os.listdir(self.hai_mask_folder) if f.startswith(f"{idx}_T_") and f.endswith(".png")]
+                
+                print(f"正在优化掩码: {orig_file} ({len(tile_files)} targets)")
+                for m_file in tile_files:
+                    # Initialize coordinates
+                    px1, py1, px2, py2 = 0, 0, 0, 0
+                    is_merged_file = "merged" in m_file
 
-                if is_merged_file:
-                    match = re.search(r"T_(\d+)_(\d+)_(\d+)_(\d+)_merged", m_file)
-                    if match: px1, py1, px2, py2 = map(int, match.groups())
-                else:
-                    match = re.search(r"T_(\d+)_(\d+)_(\d+)_(\d+)_P_", m_file)
-                    if match: px1, py1, px2, py2 = map(int, match.groups())
-                
-                if px1 == px2: continue # Invalid parsing
-                
-                # 2. Establish 1024x1024 Context Window
-                # Calculate center of the current tile
-                cx = (px1 + px2) // 2
-                cy = (py1 + py2) // 2
-                
-                # Calculate new crop coordinates (1024x1024 centered on tile)
-                crop_size = 1024
-                half_size = crop_size // 2
-                
-                c_x1 = max(0, cx - half_size)
-                c_y1 = max(0, cy - half_size)
-                c_x2 = min(original_img.width, c_x1 + crop_size)
-                c_y2 = min(original_img.height, c_y1 + crop_size)
-                
-                # Adjust if we hit the right/bottom edge
-                if (c_x2 - c_x1) < crop_size: c_x1 = max(0, c_x2 - crop_size)
-                if (c_y2 - c_y1) < crop_size: c_y1 = max(0, c_y2 - crop_size)
-                
-                # Extract the 1024 context image
-                context_img = original_img.crop((c_x1, c_y1, c_x2, c_y2))
-                
-                # Pad if image is smaller than 1024 (e.g. small original image)
-                if context_img.size != (1024, 1024):
-                    temp = Image.new("RGB", (1024, 1024), (0,0,0))
-                    temp.paste(context_img, (0,0))
-                    context_img = temp
+                    # CHANGE 2: Dual Regex logic
+                    if is_merged_file:
+                        match = re.search(r"T_(\d+)_(\d+)_(\d+)_(\d+)_merged", m_file)
+                        if match:
+                            px1, py1, px2, py2 = map(int, match.groups())
+                        else:
+                            print(f"Warning: Could not parse merged coords from {m_file}")
+                            continue
+                    else:
+                        match = re.search(r"T_(\d+)_(\d+)_(\d+)_(\d+)_P_(-?\d+)_(-?\d+)_(\d+)_(\d+)", m_file)
+                        if match:
+                            px1, py1, px2, py2 = map(int, match.groups()[4:8])
+                        else:
+                            continue
+                    
+                    # Extract the clean partial image from source
+                    clean_tile = extract_padded_tile(original_img, (px1, py1, px2, py2))
+                    
+                    file_path = os.path.join(self.hai_mask_folder, m_file)
+                    marked_tile = Image.open(file_path).convert("RGB")
+                        
+                        # Ensure sizes match (vital for merged files if rounding errors occurred)
+                    if clean_tile.size != marked_tile.size:
+                        clean_tile = clean_tile.resize(marked_tile.size)
 
-                # 3. Load the specific mask tile and place it into the Context
-                file_path = os.path.join(self.hai_mask_folder, m_file)
-                marked_tile = Image.open(file_path).convert("RGB")
-                tile_mask = extract_mask_from_green(marked_tile) # Your existing helper
-                
-                # Create a blank 1024 mask and paste the small tile mask into it
-                # We need to calculate where the small tile sits relative to the 1024 crop
-                rel_x = px1 - c_x1
-                rel_y = py1 - c_y1
-                
-                context_mask = Image.new("L", (1024, 1024), 0)
-                
-                # Resize tile_mask if needed (safety check)
-                target_w, target_h = px2 - px1, py2 - py1
-                if tile_mask.size != (target_w, target_h):
-                    tile_mask = tile_mask.resize((target_w, target_h), Image.NEAREST)
-                
-                context_mask.paste(tile_mask, (rel_x, rel_y))
-                
-                # 4. Run SAM Refinement on the 1024 canvas
-                refined_context_mask = self.refine_masks_with_sam2_points(context_img, context_mask)
-                
-                # 5. Crop the result BACK to the original tile size
-                refined_tile_mask = refined_context_mask.crop((rel_x, rel_y, rel_x + target_w, rel_y + target_h))
-                
-                # 6. Save (Re-apply green overlay)
-                # We need the original clean pixels for the small tile to overlay green on
-                clean_tile = extract_padded_tile(original_img, (px1, py1, px2, py2))
-                if clean_tile.size != refined_tile_mask.size:
-                     clean_tile = clean_tile.resize(refined_tile_mask.size)
+                    tile_mask = extract_mask_from_green(marked_tile)
+                    if not tile_mask.getbbox(): continue
 
-                green_canvas = Image.new("RGB", clean_tile.size, (0, 255, 0))
-                final_output = Image.composite(green_canvas, clean_tile, refined_tile_mask)
+                        # Optional: Add specific debug stem for merged files
+                    debug_stem = f"{idx}_merged" if is_merged_file else f"{idx}"
+                        
+                    # Run SAM2 Refinement
+                    refined_mask = self.refine_masks_with_sam2_points(clean_tile, tile_mask) #, debug_stem=debug_stem) 
+                        # Overwrite the file with new green mask
+                    green_canvas = Image.new("RGB", clean_tile.size, (0, 255, 0))
+                    refined_green_tile = Image.composite(green_canvas, clean_tile, refined_mask)
                 
-                final_output.save(file_path)
-                # print(f"   Saved refined: {m_file}")         
+                    refined_green_tile.save(file_path)
+                        
+                    if is_merged_file:
+                        print(f"  [Merged Refine] Finished: {m_file}")
 
-# --- MAIN ORCHESTRATION ---
 
 def main():
     global LOGICAL_TILE_W, LOGICAL_TILE_H
@@ -545,7 +562,7 @@ def main():
     parser.add_argument("--output", type=str, default=DEFAULT_OUTPUT_FOLDER)
     parser.add_argument("--hai_path", type=str, default=DEFAULT_HAI_PATH)
     parser.add_argument("--temp_tiles", type=str, default=DEFAULT_TEMP_TILES_FOLDER)
-    parser.add_argument("--black_level", type=int, default=0, help="0-255: Darkens gray pixels below this threshold to pure black to improve detection.")
+    parser.add_argument("--black_level", type=int, default=20, help="0-255: Darkens gray pixels below this threshold to pure black to improve detection.")
     parser.add_argument("--min_size", type=int, default=1200, help="Upscale images smaller than this dimension")
     parser.add_argument("--sam_strategy", type=str, choices=["score", "area", "union", "min", "middle", "max"], default="score", help="Strategy to select SAM mask: 'score' (default), 'min' (smallest area), 'middle' (median), 'max' (largest), 'union' (merge all)")
     
@@ -573,21 +590,16 @@ def main():
         LOGICAL_TILE_H = 2000
         mask_manager.segment_images_to_temp()
         mask_manager.run_hai_detection(args.mosaic, clear_existing=True)
-        print(">>> 启动阶段 2: 重点区域二次检测 (Focused Detection) <<<")
+        # print(">>> 启动阶段 2: 重点区域二次检测 (Focused Detection) <<<")
         mask_manager.segment_focused_from_coarse()
         mask_manager.run_hai_detection(args.mosaic, clear_existing=False)
-        
         if args.mosaic == 2:
             print(">>> 启动阶段 3: 切片掩码优化 (Refining Mask Tiles) <<<")
             mask_manager.mask_refinement_process()
-        
+            # print(">>> 启动阶段 3: 切片掩码再优化 (Refining Mask Tiles Twice) <<<")
         print(">>> 启动阶段 4: 合并检测结果 (Merging Masks) <<<")
         mask_manager.merge_detection_results()
-        
-        if args.mosaic == 2:
-            print(">>> 启动阶段 3: 切片掩码再优化 (Refining Mask Tiles Twice) <<<")
-            mask_manager.args.sam_strategy = 'max'
-            mask_manager.mask_refinement_process()
+        # if args.mosaic == 2:
             # mask_manager.mask_refinement_process()
         mask_manager.unload_sam2()
         cleanup_gpu()
