@@ -31,8 +31,8 @@ BATCH_SIZE = 1
 # [CRITICAL] Tuned for Small Dataset (450 images)
 LEARNING_RATE = 1e-6
 EPOCHS = 10  # STOP EARLY. Do not go to 15.
-RANK = 32    # Low rank prevents memorization
-ALPHA = 32    # Alpha < Rank = More stable, less aggressive
+RANK = 16    # Low rank prevents memorization
+ALPHA = 8    # Alpha < Rank = More stable, less aggressive
 DROPOUT = 0.1 # Randomly disable neurons to force robust learning
 
 TRIGGER_WORD = "reconstruct, genital detail, high quality, uncensored"
@@ -42,7 +42,6 @@ OUTPUT_DIR = f"./output_lora_{TRAIN_MODE}"
 def train():
     device = "cuda"
     weight_dtype = torch.float16
-
     # 1. Load Models
     # VAE MUST BE FLOAT32 for accurate encoding
     vae = AutoencoderKL.from_pretrained(MODEL_PATH, subfolder="vae").to(device, dtype=torch.float32)
@@ -58,6 +57,7 @@ def train():
         lora_alpha=ALPHA, 
         target_modules=["to_k", "to_q", "to_v", "to_out.0", "add_k_proj", "add_v_proj", "ff.net.0.proj", "ff.net.2"],
         lora_dropout=DROPOUT,
+        # use_dora=True,
     )
     unet = get_peft_model(unet, lora_config)
     unet.train()

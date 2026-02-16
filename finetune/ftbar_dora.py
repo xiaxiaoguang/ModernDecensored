@@ -15,6 +15,11 @@ from diffusers import (
 from transformers import AutoTokenizer, CLIPTextModel, CLIPTextModelWithProjection
 from peft import LoraConfig, get_peft_model
 from accelerate import Accelerator # <--- Added for Multi-GPU
+import sys
+current_dir = os.path.dirname(os.path.abspath(__file__))
+parent_dir = os.path.dirname(current_dir)
+sys.path.append(parent_dir)
+
 from utils.datasets import RobustInpaintDataset,save_compatible_lora,visualize_results
 
 # --- CONFIGURATION ---
@@ -26,9 +31,9 @@ BATCH_SIZE = 1 # Effective batch size will be BATCH_SIZE * Num GPUs
 
 # [CRITICAL] Tuned for Small Dataset (500 images)
 LEARNING_RATE = 2e-6
-EPOCHS = 5
-RANK = 8    
-ALPHA = 8    
+EPOCHS = 10
+RANK = 16   
+ALPHA = 8
 DROPOUT = 0.1 
 
 TRIGGER_WORD = "reconstruct, genital detail, high quality, uncensored"
@@ -37,6 +42,7 @@ OUTPUT_DIR = f"./output_lora_{TRAIN_MODE}"
 def train():
     # 1. Initialize Accelerator
     accelerator = Accelerator(mixed_precision="fp16")
+    device = accelerator.device
     weight_dtype = torch.float16
 
     # 2. Load Models

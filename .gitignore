@@ -20,3 +20,4 @@ oss
 checkpoints/
 sam2_saved/
 sam2_transformers_finetuned/
+*.pt
