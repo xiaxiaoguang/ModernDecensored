@@ -22,3 +22,4 @@ input/
 sam2_transformers_finetuned/
 checkpoints/
 *.pt
+runs/

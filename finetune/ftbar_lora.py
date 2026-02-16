@@ -134,10 +134,10 @@ def train():
         visualize_results(MODEL_PATH, chk_path, dataset, os.path.join(chk_path, "visuals"))
 
 if __name__ == "__main__":
-    train()
+    # train()
     # TRAIN_MODE = "bar" 
     # OUTPUT_DIR = f"./output_lora_{TRAIN_MODE}"
     # train()
-    # chk_path=f"./output_lora_{TRAIN_MODE}/checkpoint-3"
-    # dataset = RobustInpaintDataset(BASE_DATASET_ROOT, RESOLUTION, TRAIN_MODE, augment_mask=False)
-    # visualize_results(MODEL_PATH, chk_path, dataset, os.path.join(chk_path, "visuals"),num_samples=20)
+    chk_path=f"./output_lora_{TRAIN_MODE}/checkpoint-8"
+    dataset = RobustInpaintDataset(BASE_DATASET_ROOT, RESOLUTION, TRAIN_MODE, augment_mask=False)
+    visualize_results(MODEL_PATH, chk_path, dataset, os.path.join(chk_path, "visuals"), num_samples=20)

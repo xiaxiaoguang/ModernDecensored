@@ -131,7 +131,7 @@ def test_inference_and_mask(weights_path):
         return
 
     # Test on the first 5 images in the validation set
-    for img_name in val_images[:5]:
+    for img_name in val_images[:10]:
         img_path = os.path.join(val_img_dir, img_name)
         
         # High Recall Inference (iou=0.6, conf=0.05)
@@ -150,14 +150,11 @@ def test_inference_and_mask(weights_path):
                 found_bars += 1
                 # xyxy[0] returns coordinates perfectly mapped to the original image dimensions
                 x1, y1, x2, y2 = map(int, box.xyxy[0])
-                
                 # Crop the raw region
                 roi = orig_img[y1:y2, x1:x2]
-                
                 # Extract black pixels
                 is_black = np.all(roi <= [5, 5, 5], axis=-1)
                 final_mask[y1:y2, x1:x2][is_black] = 255
-                
                 # Draw green box for visualization
                 cv2.rectangle(orig_img, (x1, y1), (x2, y2), (0, 255, 0), 3)
         
