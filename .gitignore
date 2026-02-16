@@ -19,3 +19,6 @@ temp_tiles/
 oss
 sam2_saved/
 input/
+sam2_transformers_finetuned/
+checkpoints/
+*.pt
