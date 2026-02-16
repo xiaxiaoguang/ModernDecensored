@@ -26,4 +26,4 @@ python work.py --input "G:\manga\Z2" --output "G:\manga\Z2-1" --mosaic 2 --mode 
 @REM python utils/webptopdf.py "G:\manga\Z6-1" "G:\manga\Z5-1" "G:\manga\Z4-1" "G:\manga\Z3-1" "G:\manga\Z2-1" "G:\manga\Z1-3"
 @REM python utils/webptopdf.py "G:\manga\Z8" "G:\manga\Z9" "G:\manga\Z10" "G:\manga\Z11" "G:\manga\Z12"
 @REM python utils/webptopdf.py "G:\manga\K1" "G:\manga\K8"  "G:\manga\K4" "G:\manga\K2" "G:\manga\K3" "G:\manga\K10" "G:\manga\K9" 
-python utils/webptopdf.py "G:\manga\K1" 
+python utils/webptopdf.py "G:\manga\K2" 

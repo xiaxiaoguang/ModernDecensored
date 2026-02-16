@@ -17,8 +17,8 @@ DEFAULT_INPUT_FOLDER = r"E:\MangaTranslator\HAI\HAI\input"
 DEFAULT_OUTPUT_FOLDER = r"E:\MangaTranslator\HAI\HAI\output"
 DEFAULT_DEBUG_FOLDER = r"E:\MangaTranslator\HAI\HAI\debug_masks"
 DEFAULT_TEMP_TILES_FOLDER = r"E:\MangaTranslator\HAI\HAI\temp_tiles"
-SAM2_MODEL_PATH = r"E:\MangaTranslator\MangaTranslator\models\sam\models--facebook--sam2.1-hiera-large\snapshots\665f8e2ad61cf5f53d65644ff27c8ee525124610"
-
+# SAM2_MODEL_PATH = r"E:\MangaTranslator\MangaTranslator\models\sam\models--facebook--sam2.1-hiera-large\snapshots\665f8e2ad61cf5f53d65644ff27c8ee525124610"
+SAM2_MODEL_PATH=r"E:\MangaTranslator\HAI\HAI\sam2_saved\best_model3"
 # Performance & Quality Settings
 MAX_DIMENSION = 2000
 MIN_DIMENSION = 2000

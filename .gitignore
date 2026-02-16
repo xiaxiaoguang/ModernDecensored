@@ -17,7 +17,7 @@ decensor_input/
 decensor_input_original/
 temp_tiles/
 oss
-checkpoints/
 sam2_saved/
 sam2_transformers_finetuned/
+checkpoints/
 *.pt
