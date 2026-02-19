@@ -2,11 +2,18 @@ import os
 import torch
 import numpy as np
 import random
+import csv
 import matplotlib.pyplot as plt
 from PIL import Image
 from torch.utils.data import Dataset, DataLoader, random_split, Subset
 from torch.optim import AdamW
 from tqdm import tqdm
+
+import sys
+current_dir = os.path.dirname(os.path.abspath(__file__))
+parent_dir = os.path.dirname(current_dir)
+sys.path.append(parent_dir)
+from utils.datasets import SAM2Dataset
 
 # --- TRANSFORMERS IMPORTS ---
 from transformers import Sam2Model, Sam2Processor
@@ -20,65 +27,8 @@ DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 # Training Config
 BATCH_SIZE = 1 
 GRADIENT_ACCUMULATION_STEPS = 8 
-LR = 2e-6 
-EPOCHS = 60
-
-class SAM2Dataset(Dataset):
-    def __init__(self, root_dir, processor, mode="bar"):
-        self.root_dir = root_dir
-        self.processor = processor
-        self.entries = []
-        
-        search_path = os.path.join(root_dir, f"inpainter_{mode}", "censored")
-        mask_root = os.path.join(root_dir, f"inpainter_{mode}", "mask")
-        
-        if os.path.exists(search_path):
-            files = [f for f in os.listdir(search_path) if f.endswith('.png') or f.endswith('.jpg')]
-            for f in files:
-                mask_path = os.path.join(mask_root, f)
-                if os.path.exists(mask_path):
-                    self.entries.append({
-                        "image_path": os.path.join(search_path, f),
-                        "mask_path": mask_path
-                    })
-        
-        print(f"[*] Found {len(self.entries)} total pairs.")
-
-    def __len__(self):
-        return len(self.entries)
-
-    def __getitem__(self, idx):
-        entry = self.entries[idx]
-        
-        image = Image.open(entry["image_path"]).convert("RGB")
-        gt_mask = Image.open(entry["mask_path"]).convert("L")
-        
-        image_np = np.array(image)
-        mask_np = np.array(gt_mask) > 128
-        
-        # Simulate Prompt
-        y_indices, x_indices = np.where(mask_np)
-        if len(y_indices) > 0:
-            rand_idx = random.randint(0, len(y_indices) - 1)
-            prompt_point = [int(x_indices[rand_idx]), int(y_indices[rand_idx])]
-            prompt_label = 1 
-        else:
-            prompt_point = [512, 512]
-            prompt_label = 0
-
-        inputs = self.processor(
-            images=image, 
-            input_points=[[[prompt_point]]], 
-            input_labels=[[[prompt_label]]], 
-            return_tensors="pt"
-        )
-        
-        inputs = {k: v.squeeze(0) for k, v in inputs.items()}
-        
-        gt_mask_resized = gt_mask.resize((256, 256), Image.NEAREST)
-        inputs["ground_truth_mask"] = torch.tensor(np.array(gt_mask_resized) > 128).float()
-
-        return inputs
+LR = 1e-6
+EPOCHS = 200
 
 def compute_iou(pred_mask, gt_mask):
     """Calculates Intersection over Union for binary masks"""
@@ -208,7 +158,6 @@ def main():
 
     # --- FREEZING STRATEGY ---
     for name, param in model.named_parameters():
-        # breakpoint()
         if "mask_decoder" in name:
             param.requires_grad = True
         else:
@@ -217,15 +166,15 @@ def main():
     # --- DATASET & SPLITTING ---
     full_dataset = SAM2Dataset(DATASET_ROOT, processor, mode="bar")
     
-    # Split: 90% Train, 10% Test
+    # Split: 90% Train, 10% Validation
     train_size = int(0.95 * len(full_dataset))
-    test_size = len(full_dataset) - train_size
-    train_dataset, test_dataset = random_split(full_dataset, [train_size, test_size])
+    val_size = len(full_dataset) - train_size
+    train_dataset, val_dataset = random_split(full_dataset, [train_size, val_size])
     
-    print(f"[*] Split: {train_size} Training | {test_size} Testing")
+    print(f"[*] Split: {train_size} Training | {val_size} Validation")
     
     train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
-    test_loader = DataLoader(test_dataset, batch_size=1, shuffle=False) # Batch 1 for accurate IoU calc
+    val_loader = DataLoader(val_dataset, batch_size=1, shuffle=False) 
     
     optimizer = AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=LR)
     loss_fn = torch.nn.BCEWithLogitsLoss()
@@ -233,7 +182,15 @@ def main():
     model.train()
     print("[*] Training Start...")
 
-    best_test_iou = 0.0
+    best_val_iou = 0.0
+    
+    # --- METRICS TRACKING ---
+    history = {
+        "epoch": [],
+        "train_loss": [],
+        "val_loss": [],
+        "val_iou": []
+    }
 
     for epoch in range(EPOCHS):
         total_loss = 0
@@ -266,14 +223,27 @@ def main():
             total_loss += loss.item() * GRADIENT_ACCUMULATION_STEPS
             pbar.set_postfix({"loss": f"{loss.item() * GRADIENT_ACCUMULATION_STEPS:.4f}"})
         
-        # --- EVALUATION LOOP (Check Overfitting) ---
-        print(f"\n[*] Evaluating on {test_size} Unseen Test Images...")
-        test_loss, test_iou = evaluate_model(model, test_loader, desc=f"Epoch {epoch+1} [Test]")
+        avg_train_loss = total_loss / len(train_loader)
+
+        # --- EVALUATION LOOP ---
+        print(f"\n[*] Evaluating on {val_size} Unseen Validation Images...")
+        # Note: Ensure your evaluate_model function returns (loss, iou)
+        val_loss, val_iou = evaluate_model(model, val_loader, desc=f"Epoch {epoch+1} [Val]")
         
-        print(f"Results Ep {epoch+1}: Train Loss {total_loss/len(train_loader):.4f} | Test Loss {test_loss:.4f} | Test IoU {test_iou:.4f}")
+        print(f"Results Ep {epoch+1}: Train Loss {avg_train_loss:.4f} | Val Loss {val_loss:.4f} | Val IoU {val_iou:.4f}")
         
-        if test_iou > best_test_iou:
-            best_test_iou = test_iou
+        # --- UPDATE HISTORY & SAVE GRAPHS ---
+        history["epoch"].append(epoch + 1)
+        history["train_loss"].append(avg_train_loss)
+        history["val_loss"].append(val_loss)
+        history["val_iou"].append(val_iou)
+        
+        save_learning_curve(history, OUTPUT_DIR)
+        save_training_log(history, OUTPUT_DIR)
+        
+        # --- CHECKPOINTING ---
+        if val_iou > best_val_iou:
+            best_val_iou = val_iou
             print(f"  >>> NEW BEST MODEL! Saving...")
             save_path = os.path.join(OUTPUT_DIR, "best_model")
             model.save_pretrained(save_path)
@@ -283,8 +253,51 @@ def main():
         model.save_pretrained(os.path.join(OUTPUT_DIR, f"checkpoint-ep{epoch+1}"))
         processor.save_pretrained(os.path.join(OUTPUT_DIR, f"checkpoint-ep{epoch+1}"))
         
-        # Visualize TEST images (Not train images)
-        visualize_validation(model, test_dataset, epoch, OUTPUT_DIR)
+        # Visualize Validation images
+        visualize_validation(model, val_dataset, epoch, OUTPUT_DIR)
+
+# --- HELPER FUNCTIONS FOR VISUALIZATION ---
+
+def save_learning_curve(history, output_dir):
+    """Generates and updates the learning curve plot after each epoch."""
+    plt.figure(figsize=(12, 5))
+    
+    # Plot 1: Losses
+    plt.subplot(1, 2, 1)
+    plt.plot(history["epoch"], history["train_loss"], label='Train Loss', marker='o')
+    plt.plot(history["epoch"], history["val_loss"], label='Validation Loss', marker='o')
+    plt.title('Training and Validation Loss')
+    plt.xlabel('Epoch')
+    plt.ylabel('Loss')
+    plt.legend()
+    plt.grid(True)
+    
+    # Plot 2: IoU Score
+    plt.subplot(1, 2, 2)
+    plt.plot(history["epoch"], history["val_iou"], label='Validation IoU', color='green', marker='o')
+    plt.title('Validation IoU Score')
+    plt.xlabel('Epoch')
+    plt.ylabel('IoU')
+    plt.legend()
+    plt.grid(True)
+    
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, "learning_curve.png"))
+    plt.close()
+
+def save_training_log(history, output_dir):
+    """Saves the raw metrics to a CSV file for easy inspection later."""
+    csv_path = os.path.join(output_dir, "training_log.csv")
+    with open(csv_path, mode='w', newline='') as file:
+        writer = csv.writer(file)
+        writer.writerow(["Epoch", "Train Loss", "Validation Loss", "Validation IoU"])
+        for i in range(len(history["epoch"])):
+            writer.writerow([
+                history["epoch"][i], 
+                f"{history['train_loss'][i]:.6f}", 
+                f"{history['val_loss'][i]:.6f}", 
+                f"{history['val_iou'][i]:.6f}"
+            ])
 
 if __name__ == "__main__":
     main()

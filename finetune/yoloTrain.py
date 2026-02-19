@@ -1,3 +1,4 @@
+# =================================================
 import os
 import random
 import shutil
@@ -9,42 +10,38 @@ import numpy as np
 from pathlib import Path
 from ultralytics import YOLO
 
-# ================= CONFIGURATION =================
-# Source directories (where your current unsplit data is)
-SOURCE_IMAGES = "./dataset_refined/yolo/images"
+import sys
+current_dir = os.path.dirname(os.path.abspath(__file__))
+parent_dir = os.path.dirname(current_dir)
+sys.path.append(parent_dir)
+from utils.datasets import synthesize_manga_occlusions
 
+# ================= CONFIGURATION =================
+SOURCE_IMAGES = "./dataset_refined/yolo/images"
 SOURCE_LABELS = "./dataset_refined/yolo/labels"
 
-# Target YOLO structured dataset
 DATASET_ROOT = "./dataset_yolo" 
 DATA_YAML = os.path.join(DATASET_ROOT, "manga_data.yaml")
 
 MODEL_SIZE = "yolo11l.pt"  
 TRAIN_GPUS = [1]
-TRAIN_EPOCHS = 100
+TRAIN_EPOCHS = 200
 TRAIN_IMGSZ = 1024
 
 HOME_GPU_ID = 0
-# =================================================
 
 def setup_and_split_dataset(train_ratio=0.8):
-    """
-    Creates YOLO directory structure and randomly splits data into Train/Val sets.
-    """
-    print(f"--- 🗂️ PREPARING DATASET ({train_ratio*100}% Train / {(1-train_ratio)*100}% Val) ---")
+    print(f"--- 🗂️ PREPARING DATASET AND GENERATING OCCLUSIONS ({train_ratio*100}% Train / {(1-train_ratio)*100}% Val) ---")
     
-    # Create YOLO folder structure
     dirs = {
         "train_img": os.path.join(DATASET_ROOT, "images/train"),
         "val_img": os.path.join(DATASET_ROOT, "images/val"),
         "train_lbl": os.path.join(DATASET_ROOT, "labels/train"),
         "val_lbl": os.path.join(DATASET_ROOT, "labels/val")
     }
-    
     for d in dirs.values():
         os.makedirs(d, exist_ok=True)
 
-    # Get all images
     all_images = [f for f in os.listdir(SOURCE_IMAGES) if f.endswith(('.png', '.jpg', '.jpeg'))]
     random.shuffle(all_images)
     
@@ -52,7 +49,7 @@ def setup_and_split_dataset(train_ratio=0.8):
     train_files = all_images[:split_idx]
     val_files = all_images[split_idx:]
     
-    def copy_files(file_list, img_dest, lbl_dest):
+    def copy_files(file_list, img_dest, lbl_dest, is_train=False):
         valid_count = 0
         for img_name in file_list:
             base_name = os.path.splitext(img_name)[0]
@@ -61,19 +58,33 @@ def setup_and_split_dataset(train_ratio=0.8):
             src_img = os.path.join(SOURCE_IMAGES, img_name)
             src_lbl = os.path.join(SOURCE_LABELS, txt_name)
             
-            # Only copy if both image and label exist
             if os.path.exists(src_lbl):
+                # 1. Copy the clean, original image
                 shutil.copy(src_img, os.path.join(img_dest, img_name))
                 shutil.copy(src_lbl, os.path.join(lbl_dest, txt_name))
                 valid_count += 1
+                
+                # 2. Duplicate and mutate the training data only
+                if is_train:
+                    aug_img_name = f"{base_name}_aug.jpg"
+                    aug_txt_name = f"{base_name}_aug.txt"
+                    
+                    # The bounding box remains exactly the same, so we duplicate the label
+                    shutil.copy(src_lbl, os.path.join(lbl_dest, aug_txt_name))
+                    
+                    # Synthesize the visual occlusions on the new image copy
+                    aug_img_path = os.path.join(img_dest, aug_img_name)
+                    synthesize_manga_occlusions(src_img, src_lbl, aug_img_path)
+                    valid_count += 1
+                    
         return valid_count
 
-    print("Copying Training files...")
-    train_count = copy_files(train_files, dirs["train_img"], dirs["train_lbl"])
-    print("Copying Validation files...")
-    val_count = copy_files(val_files, dirs["val_img"], dirs["val_lbl"])
+    print("Copying Training files & Injecting Synthesized Occlusions...")
+    train_count = copy_files(train_files, dirs["train_img"], dirs["train_lbl"], is_train=True)
+    print("Copying Validation files (Clean only)...")
+    val_count = copy_files(val_files, dirs["val_img"], dirs["val_lbl"], is_train=False)
     
-    print(f"✅ Split Complete! Train: {train_count} | Val: {val_count}\n")
+    print(f"✅ Split Complete! Train Samples: {train_count} | Val Samples: {val_count}\n")
 
 def create_yaml():
     print("--- 📝 GENERATING DATA.YAML ---")
@@ -100,23 +111,23 @@ def train_model():
         data=DATA_YAML,
         epochs=TRAIN_EPOCHS,
         imgsz=TRAIN_IMGSZ,
-        batch=10,
-        device=TRAIN_GPUS,      
+        batch=7,
+        device=TRAIN_GPUS,
         workers=16,
         project="manga_decensor_project",
         name=MODEL_SIZE,
         exist_ok=True,
         mosaic=1.0, 
         degrees=15.0,
-        scale=0.5,              
-        fliplr=0.5,             
+        scale=0.5,
+        fliplr=0.5,
         hsv_h=0.0,
         hsv_s=0.0,
-        hsv_v=0.0, 
+        hsv_v=0.0,
         amp=False,
     )
     print("--- ✅ TRAINING COMPLETE ---")
-    return "runs/detect/manga_decensor_project/11mrun/weights/best.pt"
+    return f"./runs/detect/manga_decensor_project/{MODEL_SIZE}/weights/best.pt"
 
 def test_inference_and_mask(weights_path):
     print(f"\n--- 🏠 RUNNING INFERENCE ON VALIDATION SET ---")
@@ -169,8 +180,8 @@ if __name__ == "__main__":
     # setup_and_split_dataset(train_ratio=0.9)
     # create_yaml()
     
-    # 2. Train
+    # # 2. Train
     best_weights = train_model()
     
-    # 3. Test
+    # # 3. Test
     test_inference_and_mask(best_weights)
