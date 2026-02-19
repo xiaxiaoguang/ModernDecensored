@@ -29,9 +29,14 @@ class DecensorMaskManager:
         
     def preprocess_smart_detection(self, img, debug=False):
         """
-        Improved Preprocessing: separating 'Artificial Black' from 'Artistic Dark'.
-        Uses Fast Local Variance instead of Laplacian for better texture discrimination.
+        Targeted Preprocessing: Heals dents and holes in existing black bars caused by 
+        overlapping manga effects (liquids, bubbles) using Convex Hulls, 
+        without hallucinating new bars.
         """
+        import cv2
+        import numpy as np
+        from PIL import Image
+
         img_np = np.array(img)
         
         # 1. Working Channel: 'L' from LAB is best for lightness separation
@@ -41,14 +46,14 @@ class DecensorMaskManager:
         else:
             l_channel = img_np.copy()
 
-        # --- IMPROVED LOGIC: Fast Local Variance Map ---
+        # --- Fast Local Variance Map ---
         k_size = (5, 5) 
         mean_l = cv2.boxFilter(l_channel, cv2.CV_32F, k_size)
         sqr_l = cv2.sqrBoxFilter(l_channel, cv2.CV_32F, k_size)
         variance = np.abs(sqr_l - mean_l**2)
         std_dev = np.sqrt(variance)
 
-        # --- MASK CREATION ---
+        # --- Base Mask Creation ---
         intensity_limit = self.args.black_level if self.args.black_level > 0 else 30
         flatness_limit = 5.0  
         
@@ -56,20 +61,38 @@ class DecensorMaskManager:
         is_flat = std_dev < flatness_limit
         
         raw_mask = np.bitwise_and(is_dark, is_flat.astype(bool)).astype(np.uint8) * 255
-        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3,3))
-        clean_mask = cv2.morphologyEx(raw_mask, cv2.MORPH_OPEN, kernel) 
-        clean_mask = cv2.morphologyEx(clean_mask, cv2.MORPH_CLOSE, kernel) 
 
-        # --- VISUALIZATION ---
-        if debug:
-            import matplotlib.pyplot as plt
-            # ... (Debug plotting logic remains unchanged) ...
-            plt.show() 
+        # Light cleanup to remove tiny stray pixels before contouring
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+        clean_mask = cv2.morphologyEx(raw_mask, cv2.MORPH_OPEN, kernel)
+
+        # --- STRATEGY: CONVEX HULL HEALING ---
+        # Find the outlines of existing, continuous black regions
+        contours, _ = cv2.findContours(clean_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        repaired_mask = np.zeros_like(clean_mask)
+        
+        # Filter out random small screentone dust so we only process sizable chunks
+        MIN_AREA_THRESHOLD = 150 
+        
+        for cnt in contours:
+            if cv2.contourArea(cnt) > MIN_AREA_THRESHOLD:
+                # The Convex Hull snaps a tight boundary around the outermost points of the blob.
+                # This naturally bridges any "bites" or "dents" taken out by overlapping effects.
+                hull = cv2.convexHull(cnt)
+                
+                # Draw the repaired shape completely filled in to crush internal text/noise
+                cv2.drawContours(repaired_mask, [hull], 0, 255, thickness=cv2.FILLED)
+
+        # A mild morphological close just to smooth the repaired edges slightly
+        smooth_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
+        final_mask = cv2.morphologyEx(repaired_mask, cv2.MORPH_CLOSE, smooth_kernel)
 
         # --- RENDERING (CLAHE + Black Crush) ---
         clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8,8))
         l_enhanced = clahe.apply(l_channel)
-        l_enhanced[clean_mask > 0] = 0
+        # Image.fromarray(final_mask).save("mask.png")
+        # Apply our tightly healed mask back to the image
+        l_enhanced[final_mask > 0] = 0
         
         if img_np.ndim == 3:
             merged = cv2.merge((l_enhanced, a, b))
@@ -92,20 +115,22 @@ class DecensorMaskManager:
         self.sam_processor = None
         cleanup_gpu()
 
-    def run_yolo_detection(self, yolo_weights="best.pt"):
+    def run_yolo_detection(self):
         """
         Replaces tiling, GUI automation, and merging by running YOLO natively
         on the full image, extracting pure black pixels inside the bounding boxes,
+        filtering out noise by keeping only the largest connected block,
         and rendering them as a green mask over the original image.
         """
         from ultralytics import YOLO
+
         print("模式: YOLO - 启动端到端全图检测与掩码生成...")
         
         if os.path.exists(self.hai_mask_folder): shutil.rmtree(self.hai_mask_folder)
         os.makedirs(self.hai_mask_folder)
 
-        print(f"Loading YOLO weights from {yolo_weights}...")
-        model = YOLO(yolo_weights)
+        print(f"Loading YOLO weights from {YOLO_PATH}...")
+        model = YOLO(YOLO_PATH)
         
         input_files = [f for f in os.listdir(self.args.input) if f.lower().endswith(('.png', '.jpg', '.jpeg', '.webp', '.bmp'))]
         input_files.sort(key=lambda f: [int(c) if c.isdigit() else c.lower() for c in re.split(r'(\d+)', f)])
@@ -113,15 +138,15 @@ class DecensorMaskManager:
         for idx, orig_file in enumerate(input_files):
             orig_path = os.path.join(self.args.input, orig_file)
             original_img = smart_resize(Image.open(orig_path).convert("RGB"))
+            original_img = self.preprocess_smart_detection(original_img)
+            # original_img.save("1.png")
+            # breakpoint()
             w, h = original_img.size
             
             # Predict directly on the high-res original image
-            # iou=0.6 and conf=0.05 ensure high recall for all potential bars
             results = model.predict(orig_path, imgsz=1024, conf=0.05, iou=0.6, device=self.device, verbose=False)
-            
             # Convert PIL image to OpenCV BGR for fast NumPy slicing
             orig_cv = cv2.cvtColor(np.array(original_img), cv2.COLOR_RGB2BGR)
-            
             # Create a blank grayscale canvas for the precise black pixel mask
             full_rough_mask = np.zeros((h, w), dtype=np.uint8)
             
@@ -130,19 +155,44 @@ class DecensorMaskManager:
                 if int(box.cls[0]) == 1: # Assuming Class 1 is 'black_bar'
                     found_bars += 1
                     x1, y1, x2, y2 = map(int, box.xyxy[0])
-                    
                     # Crop the region of interest defined by the bounding box
                     roi = orig_cv[y1:y2, x1:x2]
-                    
-                    # Find pure black pixels (using <=5 to tolerate minor JPEG/compression artifacts)
+                    # Find pure black pixels 
                     is_black = np.all(roi <= [5, 5, 5], axis=-1)
+                    # Convert boolean mask to uint8 for OpenCV processing
+                    roi_mask_uint8 = (is_black * 255).astype(np.uint8)
+                    # --- NEW FILTERING LOGIC ---
+                    # Find all connected components in this bounding box
+                    num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(roi_mask_uint8, connectivity=8)
                     
-                    # Stamp those exact pixels as white onto the blank mask canvas
-                    full_rough_mask[y1:y2, x1:x2][is_black] = 255
+                    MAX_COMPONENTS = 3
+                    MIN_AREA_RATIO = 0.1
+                    if num_labels > 1:
+                        # Extract areas of all foreground components (ignore background at index 0)
+                        areas = stats[1:, cv2.CC_STAT_AREA]
+                        
+                        # Sort indices by area in descending order
+                        sorted_indices = np.argsort(areas)[::-1]
+                        
+                        # Find the area of the absolute largest component
+                        largest_area = areas[sorted_indices[0]]
+                        valid_indices = []
+                        for idx2 in sorted_indices[:MAX_COMPONENTS]:
+                            if areas[idx2] >= largest_area * MIN_AREA_RATIO:
+                                # Add 1 to shift back to actual label IDs (since we sliced [1:] earlier)
+                                valid_indices.append(idx2 + 1)
+                                
+                        clean_is_black = np.isin(labels, valid_indices)
+                        full_rough_mask[y1:y2, x1:x2][clean_is_black] = 255
+            
+            if MASK_EXPANSION_PIXELS > 0:
+                k_size = 2 * MASK_EXPANSION_PIXELS + 1
+                expansion_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k_size, k_size))
+                full_rough_mask = cv2.dilate(full_rough_mask, expansion_kernel, iterations=1)
             
             full_rough_mask_pil = Image.fromarray(full_rough_mask)
             
-            # --- Replicate the exact padding/composite logic from your old merge function ---
+            # --- Padding/composite logic ---
             p_box = (-CONTEXT_PADDING, -CONTEXT_PADDING, w + CONTEXT_PADDING, h + CONTEXT_PADDING)
             base_canvas = extract_padded_tile(original_img, p_box)
             
@@ -158,9 +208,8 @@ class DecensorMaskManager:
             # Save exactly as the downstream SAM2 logic expects
             save_path = os.path.join(self.hai_mask_folder, f"{idx}_T_0_0_{w}_{h}_merged.png")
             merged_tile.save(save_path)
-            
             print(f"  [{orig_file}] YOLO 检测完成 -> 发现 {found_bars} 个黑条框 -> {save_path}")
-
+            
     def refine_masks_with_sam2_points(self, image_1024, initial_mask_1024, limit=25):
         """
         Refines mask using SAM 2. 
@@ -279,7 +328,7 @@ class DecensorMaskManager:
                 original_img = smart_resize(Image.open(orig_path).convert("RGB"))
                 
                 # if self.args.black_level > 0:
-                original_img = self.preprocess_smart_detection(original_img)
+                # original_img = self.preprocess_smart_detection(original_img)
                 
                 # CHANGE 1: Removed 'and "merged" not in f' to allow merged files
                 tile_files = [f for f in os.listdir(self.hai_mask_folder) if f.startswith(f"{idx}_T_") and f.endswith(".png")]
@@ -338,14 +387,14 @@ def main():
     global LOGICAL_TILE_W, LOGICAL_TILE_H
     parser = argparse.ArgumentParser(description="Adaptive Buffer Manga Decensor")
     parser.add_argument("--mode", type=str, choices=["segment", "inpaint", "all", "hai", "refine", "extra"], default="all")
-    parser.add_argument("--mosaic", type=int, default=1,help='1 for mosaic, 2 for bar')
+    parser.add_argument("--mosaic", type=int, default=2,help='1 for mosaic, 2 for bar')
     parser.add_argument("--mosaic_color", type=int, default=0,help='0 for black bars, 1 for white bars')
 
     parser.add_argument("--input", type=str, default=DEFAULT_INPUT_FOLDER)
     parser.add_argument("--output", type=str, default=DEFAULT_OUTPUT_FOLDER)
     parser.add_argument("--hai_path", type=str, default=DEFAULT_HAI_PATH)
     parser.add_argument("--temp_tiles", type=str, default=DEFAULT_TEMP_TILES_FOLDER)
-    parser.add_argument("--black_level", type=int, default=20, help="0-255: Darkens gray pixels below this threshold to pure black to improve detection.")
+    parser.add_argument("--black_level", type=int, default=30, help="0-255: Darkens gray pixels below this threshold to pure black to improve detection.")
     parser.add_argument("--min_size", type=int, default=1200, help="Upscale images smaller than this dimension")
     parser.add_argument("--sam_strategy", type=str, choices=["score", "area", "union", "min", "middle", "max"], default="score", help="Strategy to select SAM mask: 'score' (default), 'min' (smallest area), 'middle' (median), 'max' (largest), 'union' (merge all)")
     

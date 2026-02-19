@@ -21,7 +21,6 @@ import cv2
 from .tools import *
 
 # Define your LoRA path (update this to your output folder)
-LORA_PATH = "./output_lora/final_lora_waifu_inpaint"
 
 class DecensorInpainter:
     def __init__(self, args):
@@ -30,7 +29,7 @@ class DecensorInpainter:
         self.hai_mask_folder = os.path.join(self.hai_dir, "decensor_input")
         self.pipeline = None
         self.target_resolution = 1024 
-        self.lora_root = r".\lora" # Assuming Windows path structure from your snippet
+        self.lora_root = LORA_PATH # Assuming Windows path structure from your snippet
         self.is_loaded = False
 
     def load_pipeline(self):
@@ -49,13 +48,12 @@ class DecensorInpainter:
 
         target_lora_name = "mosaic" if self.args.mosaic == 1 else "bar"
         lora_path = os.path.join(self.lora_root, target_lora_name)
-        # Check if LoRA exists (folder or file)
-        # We check for adapter_config.json to confirm it's a valid LoRA folder
+        self.pipeline.vae.to(torch.float32)
         if os.path.exists(lora_path):
             print(f"[Init] Loading LoRA from: {lora_path}")
             try:
                 self.pipeline.load_lora_weights(lora_path,weight_name="pytorch_lora_weights.safetensors")
-                self.pipeline.fuse_lora(lora_scale=0.5)
+                self.pipeline.fuse_lora(lora_scale=1)
                 print(f"[Init] LoRA '{target_lora_name}' successfully fused.")
             except Exception as e:
                 print(f"[Error] Failed to load/fuse LoRA: {e}")
@@ -144,12 +142,13 @@ class DecensorInpainter:
         
         if not os.path.exists(self.args.output): os.makedirs(self.args.output)
         
-        adaptive_strength = 0.66 if self.args.mosaic == 1 else 1
-        num_inference_steps = 40 if self.args.mosaic == 1 else 30
+        adaptive_strength = 0.66 if self.args.mosaic == 1 else 0.99
+        num_inference_steps = 40 if self.args.mosaic == 1 else 35
         prompts = self.get_prompts()
 
         input_files = [f for f in os.listdir(self.args.input) if f.lower().endswith(('.png', '.jpg', '.jpeg', '.webp', '.bmp'))]
         input_files.sort(key=lambda f: [int(c) if c.isdigit() else c.lower() for c in re.split(r'(\d+)', f)])
+
 
         for idx, orig_file in enumerate(input_files):
             print(f"Processing: {orig_file}")
@@ -282,15 +281,18 @@ class DecensorInpainter:
                     guidance_scale=7.5,
                     strength=adaptive_strength,
                 ).images[0]
-                # Resize back and Blend
                 inpainted_final = inpainted_st.resize(adaptive_tile.size, Image.LANCZOS)
                 inpainted_final = ImageOps.grayscale(inpainted_final).convert("RGB")
-                expanded_mask = adaptive_mask_img.filter(ImageFilter.MaxFilter(size=11))
-                # blend_mask = expanded_mask.filter(ImageFilter.GaussianBlur(radius=5))
-                result_tile = Image.composite(inpainted_final, adaptive_tile, expanded_mask)
+                mask_array = np.array(adaptive_mask_img) > 128
+                dilated_mask_array = binary_dilation(mask_array, iterations=final_dilation_iter)
+                expanded_mask = Image.fromarray((dilated_mask_array * 255).astype(np.uint8), mode='L')
+                # 4. Smooth the edges to prevent harsh seams where the inpainted area meets the original image
+                # (You had this commented out, but it's highly recommended for a natural blend)
+                blend_mask = expanded_mask.filter(ImageFilter.GaussianBlur(radius=5))
+                result_tile = Image.composite(inpainted_final, adaptive_tile, blend_mask)
                 self.save_debug_images(idx, group_id, tile_st, mask_st, result_tile)
                 output_canvas[ay1:ay2, ax1:ax2] = np.array(result_tile).astype(np.float32)
-                # coverage_mask[ay1:ay2, ax1:ax2] = True # Mark bounding box as processed to avoid re-clustering
+
 
             final_img = ImageOps.grayscale(Image.fromarray(np.clip(output_canvas, 0, 255).astype(np.uint8))).convert("RGB")
             final_img.save(os.path.join(self.args.output, f"{idx}_decensored.png"))

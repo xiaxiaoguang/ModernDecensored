@@ -18,7 +18,9 @@ DEFAULT_OUTPUT_FOLDER = r"E:\MangaTranslator\HAI\HAI\output"
 DEFAULT_DEBUG_FOLDER = r"E:\MangaTranslator\HAI\HAI\debug_masks"
 DEFAULT_TEMP_TILES_FOLDER = r"E:\MangaTranslator\HAI\HAI\temp_tiles"
 # SAM2_MODEL_PATH = r"E:\MangaTranslator\MangaTranslator\models\sam\models--facebook--sam2.1-hiera-large\snapshots\665f8e2ad61cf5f53d65644ff27c8ee525124610"
-SAM2_MODEL_PATH=r"E:\MangaTranslator\HAI\HAI\sam2_saved\best_model3"
+SAM2_MODEL_PATH=r"E:\MangaTranslator\HAI\HAI\sam2_saved\train_model60"
+LORA_PATH = r"E:\MangaTranslator\HAI\HAI\lora"
+YOLO_PATH = r"E:\MangaTranslator\HAI\HAI\yolo_saved\yolo11l.pt"
 
 # Performance & Quality Settings
 MAX_DIMENSION = 2000
@@ -27,7 +29,7 @@ LOGICAL_TILE_W = 2000
 LOGICAL_TILE_H = 2000
 CONTEXT_PADDING = 0
 INPAINT_SIZE = 1024
-MASK_EXPANSION_PIXELS = 1
+MASK_EXPANSION_PIXELS = 2
 
 
 # --- SHARED UTILITIES ---

@@ -18,12 +18,12 @@ from utils.tools import smart_resize
 
 
 # ================= CONFIGURATION =================
-INPUT_DIR = "G://manga/K6"
+INPUT_DIR = "G://manga/K5"
 OUTPUT_ROOT = "dataset_refined"
 
 # Processing Settings
 UI_RENDER_LIMIT = 1000
-DATA_PROC_LIMIT = 2000      
+DATA_PROC_LIMIT = 2000
 CROP_SIZE = 1024
 BRUSH_DEFAULT = 9
 
