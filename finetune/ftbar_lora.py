@@ -19,7 +19,7 @@ current_dir = os.path.dirname(os.path.abspath(__file__))
 parent_dir = os.path.dirname(current_dir)
 sys.path.append(parent_dir)
 
-from utils.datasets import RobustInpaintDataset,save_compatible_lora,generate_validation_grid
+from utils.datasets import RobustInpaintDataset,save_compatible_lora,visualize_results
 
 # --- CONFIGURATION ---
 TRAIN_MODE = "bar" 
@@ -30,7 +30,7 @@ BATCH_SIZE = 1
 
 # [CRITICAL] Tuned for Small Dataset (450 images)
 LEARNING_RATE = 1e-6
-EPOCHS = 10  # STOP EARLY. Do not go to 15.
+EPOCHS = 50  # STOP EARLY. Do not go to 15.
 RANK = 48    # Low rank prevents memorization
 ALPHA = 8    # Alpha < Rank = More stable, less aggressive
 DROPOUT = 0.1 # Randomly disable neurons to force robust learning
@@ -135,18 +135,17 @@ def train():
             # 1. Base MSE Loss
             loss = F.mse_loss(model_pred.float(), noise.float(), reduction="none")
             loss = loss.mean(dim=list(range(1, len(loss.shape)))) 
-            
+
             # 2. Min-SNR Loss Weights
             snr = (noise_scheduler.alphas_cumprod[timesteps] / (1 - noise_scheduler.alphas_cumprod[timesteps]))
             mse_loss_weights = torch.stack([snr, snr_gamma * torch.ones_like(snr)], dim=1).min(dim=1)[0] / (snr + 1e-5)
-            
             # Apply Min-SNR to loss
             loss = (loss * mse_loss_weights).mean()
 
             # 3. Scale Loss for Gradient Accumulation
             # We divide the loss so the accumulated gradients average out correctly over the steps
-            scaled_loss = loss / GRADIENT_ACCUMULATION_STEPS
-            scaled_loss.backward()
+            # scaled_loss = loss / GRADIENT_ACCUMULATION_STEPS
+            loss.backward()
 
             # 4. Step Optimizer ONLY when accumulation steps are reached or at the end of the epoch
             if (step + 1) % GRADIENT_ACCUMULATION_STEPS == 0 or (step + 1) == len(dataloader):
@@ -195,19 +194,14 @@ def train():
         chk_path = os.path.join(OUTPUT_DIR, f"checkpoint-{epoch+1}")
         save_compatible_lora(unet, chk_path)
         
-        generate_validation_grid(
-            val_dataset=val_dataset,
-            unet=unet,
-            vae=vae,
-            text_encoder_one=text_encoder_one,
-            text_encoder_two=text_encoder_two,
-            tokenizer_one=tokenizer_one,
-            tokenizer_two=tokenizer_two,
-            noise_scheduler=noise_scheduler,
+        visualize_results(
+            model_path=MODEL_PATH,
+            lora_folder=chk_path,
+            dataset=val_dataset,
+            num_sample=5,
+            output_dir=os.path.join(chk_path, "visuals"),
+            val_loss=avg_val_loss,
             epoch=epoch,
-            output_dir=OUTPUT_DIR,
-            device=device,
-            weight_dtype=weight_dtype
         )
         
 if __name__ == "__main__":
@@ -215,6 +209,6 @@ if __name__ == "__main__":
     # TRAIN_MODE = "bar" 
     # OUTPUT_DIR = f"./output_lora_{TRAIN_MODE}"
     # train()
-    # chk_path=f"./output_lora_{TRAIN_MODE}/checkpoint-6"
+    # chk_path=f"./output_lora_{TRAIN_MODE}/checkpoint-1"
     # dataset = RobustInpaintDataset(BASE_DATASET_ROOT, RESOLUTION, TRAIN_MODE, augment_mask=False)
     # visualize_results(MODEL_PATH, chk_path, dataset, os.path.join(chk_path, "visuals"), num_samples=20)

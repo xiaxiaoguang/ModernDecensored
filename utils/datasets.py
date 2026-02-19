@@ -370,16 +370,11 @@ def save_compatible_lora(unet, output_dir):
     save_file(diffusers_dict, os.path.join(output_dir, "pytorch_lora_weights.safetensors"))
 
 
-def generate_validation_grid(val_dataset, unet, vae, text_encoder_one, text_encoder_two, tokenizer_one, tokenizer_two, noise_scheduler, epoch, val_loss, output_dir, device, weight_dtype, num_samples=10):
-    import os
-    import csv
-    import torch
-    import numpy as np
-    from PIL import Image
-    from diffusers import StableDiffusionXLInpaintPipeline
+def visualize_results(model_path, lora_folder, dataset, output_path, num_samples=10, epoch=0, val_loss=0):
     
+    import csv
     # --- 1. CSV LOGGING ---
-    csv_path = os.path.join(output_dir, "val_loss.csv")
+    csv_path = os.path.join(output_path, "val_loss.csv")
     file_exists = os.path.isfile(csv_path)
     
     with open(csv_path, mode='a', newline='') as csvfile:
@@ -388,64 +383,48 @@ def generate_validation_grid(val_dataset, unet, vae, text_encoder_one, text_enco
         if not file_exists:
             writer.writerow(["Epoch", "Validation_Loss"])
         writer.writerow([epoch + 1, val_loss])
-        
-    print(f"\n[Visual Test] Generating Validation Samples for Epoch {epoch+1}...")
+
+    print(f"\n[Visual Test] Generating Validation Samples...")
     torch.cuda.empty_cache()
-    
     try:
-        # Initialize pipeline using the ALREADY LOADED components. 
-        pipe = StableDiffusionXLInpaintPipeline(
-            vae=vae,
-            text_encoder=text_encoder_one,
-            text_encoder_2=text_encoder_two,
-            tokenizer=tokenizer_one,
-            tokenizer_2=tokenizer_two,
-            unet=unet,
-            scheduler=noise_scheduler,
-        ).to(device, dtype=weight_dtype)
-        pipe.set_progress_bar_config(disable=True)
+        pipe = StableDiffusionXLInpaintPipeline.from_pretrained(
+            model_path, torch_dtype=torch.float16, use_safetensors=True
+        ).to("cuda")
+        pipe.load_lora_weights(lora_folder, weight_name="pytorch_lora_weights.safetensors")
+        pipe.fuse_lora()
     except Exception as e:
-        print(f"[Visual Test] Error wrapping pipeline: {e}")
+        print(f"[Visual Test] Error loading pipeline: {e}")
         return
 
-    vis_dir = os.path.join(output_dir, "visuals", f"epoch_{epoch+1}")
-    os.makedirs(vis_dir, exist_ok=True)
+    os.makedirs(output_path, exist_ok=True)
+    num_samples = min(num_samples, len(dataset))
+    indices = np.random.choice(len(dataset), num_samples, replace=False)
     
-    num_samples = min(num_samples, len(val_dataset))
-    sample_indices = np.random.choice(len(val_dataset), num_samples, replace=False)
-    base_dataset = val_dataset.dataset
-    
-    for idx in sample_indices:
-        real_idx = val_dataset.indices[idx]
-        sub_folder, filename = base_dataset.image_entries[real_idx]
+    for idx in indices:
+        sub_folder, filename = dataset.image_entries[idx]
         
         if "mosaic" in sub_folder:
             denoising_strength = 0.66
         else:
             denoising_strength = 0.99 
 
-        full_censored_path = os.path.join(base_dataset.root_dir, sub_folder, "censored", filename)
-        full_mask_path = os.path.join(base_dataset.root_dir, sub_folder, "mask", filename)
-        full_gt_path = os.path.join(base_dataset.root_dir, sub_folder, "ground_truth", filename)
+        full_censored_path = os.path.join(dataset.root_dir, sub_folder, "censored", filename)
+        full_mask_path = os.path.join(dataset.root_dir, sub_folder, "mask", filename)
+        full_gt_path = os.path.join(dataset.root_dir, sub_folder, "ground_truth", filename)
 
-        # Use Lanczos resampling for slightly better quality during resizing
-        censored = Image.open(full_censored_path).convert("RGB").resize((1024, 1024), Image.LANCZOS)
-        mask = Image.open(full_mask_path).convert("L").resize((1024, 1024), Image.LANCZOS)
-        gt = Image.open(full_gt_path).convert("RGB").resize((1024, 1024), Image.LANCZOS)
+        censored = Image.open(full_censored_path).convert("RGB").resize((1024, 1024))
+        mask = Image.open(full_mask_path).convert("L").resize((1024, 1024))
+        gt = Image.open(full_gt_path).convert("RGB").resize((1024, 1024))
         
-        # --- PERFORMANCE OPTIMIZATION ---
-        # inference_mode is faster and uses less memory than no_grad
-        with torch.inference_mode(): 
-            with torch.autocast("cuda"):
-                result = pipe(
-                    prompt="reconstruct, genital detail, high quality, uncensored, lineart, manga style",
-                    negative_prompt="mosaic, black bars, censor, error, blurry, low quality",
-                    image=censored,
-                    mask_image=mask,
-                    num_inference_steps=20, # Reduced from 35 for faster validation grids
-                    guidance_scale=7.5,
-                    strength=denoising_strength 
-                ).images[0]
+        result = pipe(
+            prompt="reconstruct, genital detail, high quality, uncensored, lineart, manga style",
+            negative_prompt="mosaic, black bars, censor, error, blurry, low quality",
+            image=censored,
+            mask_image=mask,
+            num_inference_steps=35, 
+            guidance_scale=7.5,
+            strength=denoising_strength 
+        ).images[0]
         
         w, h = censored.size
         grid = Image.new("RGB", (w * 4, h))
@@ -453,9 +432,7 @@ def generate_validation_grid(val_dataset, unet, vae, text_encoder_one, text_enco
         grid.paste(mask.convert("RGB"), (w, 0))
         grid.paste(gt, (w * 2, 0))
         grid.paste(result, (w * 3, 0))
-        
-        save_name = f"val_{filename}_s{int(denoising_strength*100)}.png"
-        grid.save(os.path.join(vis_dir, save_name))
+        grid.save(os.path.join(output_path, f"val_{filename}_s{int(denoising_strength*100)}.png"))
         
     del pipe
     torch.cuda.empty_cache()
