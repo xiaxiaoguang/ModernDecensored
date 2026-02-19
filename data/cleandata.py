@@ -27,7 +27,7 @@ def sync_masks(root_path):
     Removes images in censored/ground_truth that do not have a corresponding mask.
     Assumes filenames share the same suffix/ID format.
     """
-    subfolders = ['inpainter_bar', 'inpainter_mosaic']
+    subfolders = ['inpainter_bar']
     
     for sub in subfolders:
         base_path = Path(root_path) / sub
